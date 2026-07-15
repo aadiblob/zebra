@@ -1646,6 +1646,142 @@
     pass: "aadibob",                        // matches your sync passphrase
   };
 
+  /* ---------------- Zebra board actions ----------------
+     Zebra can create/edit/complete/delete cards & reminders when asked.
+     The AI Worker replies with normal text plus an optional fenced JSON
+     block describing actions; we pull that out, run it against the real
+     board, and never let the raw JSON reach the chat bubble. */
+
+  function extractActions(reply) {
+    const m = reply.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    if (!m) return { text: reply, actions: [] };
+    let actions = [];
+    try {
+      const parsed = JSON.parse(m[1]);
+      actions = Array.isArray(parsed.actions) ? parsed.actions : (Array.isArray(parsed) ? parsed : []);
+    } catch (e) { actions = []; }
+    const text = reply.replace(m[0], '').trim();
+    return { text: text || reply, actions };
+  }
+
+  function findCardByTitle(title) {
+    if (!title) return null;
+    const t = String(title).trim().toLowerCase();
+    if (!t) return null;
+    let c = state.cards.find(cc => (cc.title || '').trim().toLowerCase() === t);
+    if (!c) c = state.cards.find(cc =>
+      (cc.title || '').toLowerCase().includes(t) || t.includes((cc.title || '').toLowerCase()));
+    return c || null;
+  }
+  function findItemInCard(c, text) {
+    if (!c || !text) return null;
+    const t = String(text).trim().toLowerCase();
+    let item = c.items.find(it => it.text.trim().toLowerCase() === t);
+    if (!item) item = c.items.find(it =>
+      it.text.toLowerCase().includes(t) || t.includes(it.text.toLowerCase()));
+    return item || null;
+  }
+  function parseDue(str) {
+    if (!str) return null;
+    const d = new Date(str);
+    return isNaN(d.getTime()) ? null : d.getTime();
+  }
+
+  function applyZebraActions(actions) {
+    const results = [];
+    const touchedCards = new Set();
+    actions.slice(0, 6).forEach(a => {
+      if (!a || typeof a !== 'object') return;
+      try {
+        switch (a.type) {
+          case 'create_card': {
+            const c = newCard(a.title || '');
+            (a.items || []).forEach(it => {
+              const txt = typeof it === 'string' ? it : (it && it.text) || '';
+              if (!txt) return;
+              const item = { id: uid(), text: txt };
+              const due = typeof it === 'object' ? parseDue(it.due) : null;
+              if (due) item.due = due;
+              c.items.push(item);
+            });
+            touchedCards.add(c.id);
+            results.push('Created "' + (a.title || 'Untitled') + '"');
+            break;
+          }
+          case 'add_item': {
+            let c = findCardByTitle(a.card);
+            if (!c) c = newCard(a.card || '');
+            const txt = (a.text || '').trim();
+            if (!txt) break;
+            const item = { id: uid(), text: txt };
+            const due = parseDue(a.due);
+            if (due) item.due = due;
+            c.items.push(item);
+            touchedCards.add(c.id);
+            results.push('Added "' + txt + '" to ' + (c.title || 'Untitled'));
+            break;
+          }
+          case 'edit_item': {
+            const c = findCardByTitle(a.card);
+            const item = c && findItemInCard(c, a.match);
+            if (!item) break;
+            item.text = (a.text || item.text).trim();
+            touchedCards.add(c.id);
+            results.push('Updated a reminder in ' + (c.title || 'Untitled'));
+            break;
+          }
+          case 'complete_item': {
+            const c = findCardByTitle(a.card);
+            const item = c && findItemInCard(c, a.match);
+            if (!item) break;
+            c.items = c.items.filter(x => x.id !== item.id);
+            state.archive.unshift({ id: item.id, text: item.text, due: item.due || null,
+              card: c.title || 'Untitled', cardId: c.id, ts: Date.now() });
+            touchedCards.add(c.id);
+            results.push('Checked off "' + item.text + '"');
+            break;
+          }
+          case 'delete_item': {
+            const c = findCardByTitle(a.card);
+            const item = c && findItemInCard(c, a.match);
+            if (!item) break;
+            c.items = c.items.filter(x => x.id !== item.id);
+            touchedCards.add(c.id);
+            results.push('Removed "' + item.text + '"');
+            break;
+          }
+          case 'delete_card': {
+            const c = findCardByTitle(a.card);
+            if (!c) break;
+            state.cards = state.cards.filter(x => x.id !== c.id);
+            const el = document.querySelector('.card[data-id="' + c.id + '"]');
+            if (el) el.remove();
+            updateEmpty();
+            results.push('Deleted "' + (c.title || 'Untitled') + '"');
+            break;
+          }
+          case 'set_due': {
+            const c = findCardByTitle(a.card);
+            const item = c && findItemInCard(c, a.match);
+            if (!item) break;
+            const due = parseDue(a.due);
+            if (!due) break;
+            item.due = due;
+            touchedCards.add(c.id);
+            results.push('Scheduled "' + item.text + '"');
+            break;
+          }
+        }
+      } catch (e) { /* skip a malformed action, keep going */ }
+    });
+    touchedCards.forEach(id => {
+      const c = state.cards.find(x => x.id === id);
+      if (c) refreshCard(c);
+    });
+    if (results.length) { save(); renderArchive(); renderCalendar(); }
+    return results;
+  }
+
   async function askZebra(userText) {
     const typing = addMsg('bot', 'Zebra is thinking…');
     typing.classList.add('typing');
@@ -1674,13 +1810,18 @@
       });
       if (!res.ok) throw new Error('status ' + res.status);
       const data = await res.json();
-      const reply = (data.reply || "").trim() || "Hmm, I didn't catch that — try again?";
+      const raw = (data.reply || "").trim() || "Hmm, I didn't catch that — try again?";
+      const { text, actions } = extractActions(raw);
       typing.remove();
-      addMsg('bot', reply);
-      chat.push({ role: 'assistant', content: reply });
+      addMsg('bot', text || "Done!");
+      if (actions.length) {
+        const results = applyZebraActions(actions);
+        if (results.length) addMsg('bot', '✅ ' + results.join(' · '));
+      }
+      chat.push({ role: 'assistant', content: text });
       saveChat();
       // Update Zebra's long-term memory in the background (non-blocking).
-      updateMemory(userText, reply);
+      updateMemory(userText, text);
     } catch (e) {
       typing.remove();
       addMsg('bot', localZebra(userText));
